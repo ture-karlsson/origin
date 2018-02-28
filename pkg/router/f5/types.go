@@ -1,39 +1,36 @@
 package f5
 
-// f5Result represents an F5 BIG-IP LTM request response.  f5Result is used to
-// unmarshal the JSON response when receiving responses from the F5 iControl
-// REST API.  These responses generally are JSON blobs containing at least the
-// fields described in this structure.
-//
-// f5Result may be embedded into other types for requests that return objects.
-type f5Result struct {
+// Error responses from iControl REST should contain at least the following JSON payload.
+type iControlErrorResult struct {
 	// Code should match the HTTP status code.
 	Code int `json:"code"`
 
-	// Message should contain a short description of the result of the requested
-	// operation.
+	// Message should contain a short description of the result of the requested operation.
 	Message *string `json:"message"`
 }
 
-// F5Error represents an error resulting from a request to the F5 BIG-IP
-// iControl REST interface.
-type F5Error struct {
-	// f5result holds the standard header (code and message) that is included in
-	// responses from F5.
-	f5Result
+// Success responses from GET, POST, PUT and PATCH iControl REST requests should contain at least the following JSON payload.
+// Oddly enough, DELETE requests do not produce this (just an empty HTTP 200 response), so to check if DELETE succeeds look for that.
+type iControlCreateReadUpdateResult struct {
+	// Kind should contain an identifier of the updated object.
+	Kind *string `json:"kind"`
+}
 
-	// verb is the HTTP verb (GET, POST, PUT, PATCH, or DELETE) that was
-	// used in the request that resulted in the error.
+
+// RestError represents an error resulting from an iControl REST request.
+type RestError struct {
+	iControlErrorResult
+
+	// The HTTP verb (GET, POST, PUT, PATCH or DELETE) that was used in the request that resulted in the error.
 	verb string
 
-	// url is the URL that was used in the request that resulted in the error.
+	// The URL that was used in the request that resulted in the error.
 	url string
 
-	// httpStatusCode is the HTTP response status code (e.g., 200, 404, etc.).
+	// The HTTP response status code (e.g., 400, 404, etc.).
 	httpStatusCode int
 
-	// err contains a descriptive error object for error cases other than HTTP
-	// errors (i.e., non-2xx responses), such as socket errors or malformed JSON.
+	// Contains a standard error object for non-HTTP errors, such as socket errors or malformed JSON.
 	err error
 }
 
@@ -222,22 +219,28 @@ type f5RuleAction struct {
 	Name string `json:"name"`
 
 	// Forward indicates that the connection should be forwarded.
-	Forward bool `json:"forward"`
+	Forward bool `json:"forward,omitempty"`
 
 	// Pool, used with Forward and Select, indicates a pool to which the
 	// connection should be forwarded.
-	Pool string `json:"pool"`
+	Pool string `json:"pool,omitempty"`
 
 	// Request indicates that the action takes effect on requests as opposed to
 	// responses.
-	Request bool `json:"request"`
+	Request bool `json:"request,omitempty"`
 
 	// Select indicates that the action selects a destination for the connection
 	// (as opposed to resetting it).
-	Select bool `json:"select"`
+	Select bool `json:"select,omitempty"`
 
 	// Vlan is the vlan associated with the destination.
-	Vlan int `json:"vlanId"`
+	Vlan int `json:"vlanId,omitempty"`
+
+	// Target for action is http-reply if set, default http-reply type is "redirect".
+	HttpReply bool `json:"httpReply,omitempty"`
+
+	// Location for redirect, use when action is http-reply redirect.
+	Location string `json:"location,omitempty"`
 }
 
 // f5DatagroupRecord represents an F5 BIG-IP LTM data-group record.  The F5
@@ -294,6 +297,9 @@ type f5InstallCommandPayload struct {
 	// Filename specifies the path to the file that we just scpd to the F5
 	// BIG-IP host.
 	Filename string `json:"from-local-file"`
+
+	// Partition name.
+	Partition string `json:"partition"`
 }
 
 // f5SslProfilePayload represents an F5 BIG-IP LTM ssl-profile.  It describes
@@ -312,8 +318,18 @@ type f5SslProfilePayload struct {
 	// Name specifies the name of the profile.
 	Name string `json:"name"`
 
-	// ServerName specifies the vhost for the certificate and private key.
+	// ServerName specifies the SNI vhost for the certificate and private key.
 	ServerName string `json:"serverName"`
+
+	// Parent profile name.
+	DefaultsFrom string `json:"defaultsFrom"`
+
+	// Partition name.
+	Partition string `json:"partition"`
+
+	AuthenticateName string `json:"authenticateName,omitempty"`
+	CaFile string `json:"caFile,omitempty"`
+	PeerCertMode string `json:"peerCertMode,omitempty"`
 }
 
 // f5VserverProfilePayload represents a profile for an F5 BIG-IP LTM vserver.  It
@@ -334,6 +350,55 @@ type f5VserverProfilePayload struct {
 type f5AddPartitionPathPayload struct {
 	// Name is the partition path to be added.
 	Name string `json:"name"`
+}
+
+// Method:GET URL:/mgmt/tm/sys/global-settings
+type f5GlobalSettings struct {
+	// tm:sys:global-settings:global-settingsstate
+	iControlCreateReadUpdateResult
+
+	Hostname     string `json:"hostname"`
+}
+
+// Method:GET URL:/sys/folder
+type f5SysFolder struct {
+	// tm:sys:folder:folderstate
+	iControlCreateReadUpdateResult
+
+	DeviceGroup  string `json:"deviceGroup"`
+	TrafficGroup string `json:"trafficGroup"`
+}
+
+// Method:GET URL:/cm/traffic-group/~partition~traffic-group/stats
+type f5CmTrafficGroupAllDevicesStatus struct {
+	// tm:cm:traffic-group:traffic-groupstats
+	iControlCreateReadUpdateResult
+
+	Entries      map[string]f5CmTrafficGroupAllDevicesNestedLink `json:"entries"`
+}
+
+// Method:GET URL:/cm/traffic-group/~partition~traffic-group:~partition~device/stats (maybe)
+type f5CmTrafficGroupAllDevicesNestedLink struct {
+	Nested      f5CmTrafficGroupOneDeviceStatus `json:"nestedStats"`
+}
+
+// Method:GET URL:/cm/traffic-group/~partition~traffic-group:~partition~device/stats (maybe)
+type f5CmTrafficGroupOneDeviceStatus struct {
+	// tm:cm:traffic-group:traffic-groupstats
+	iControlCreateReadUpdateResult
+
+	Properties   f5CmTrafficGroupOneDeviceEntries `json:"entries"`
+}
+
+type f5CmTrafficGroupOneDeviceEntries struct {
+	DeviceName   f5CmTrafficGroupDeviceStatusKeyValueItem `json:"deviceName"`
+	FailoverState f5CmTrafficGroupDeviceStatusKeyValueItem `json:"failoverState"`
+	NextActive   f5CmTrafficGroupDeviceStatusKeyValueItem `json:"nextActive"`
+	TrafficGroup f5CmTrafficGroupDeviceStatusKeyValueItem `json:"trafficGroup"`
+}
+
+type f5CmTrafficGroupDeviceStatusKeyValueItem struct {
+	Value        string `json:"description"`
 }
 
 // Method:POST URL:/mgmt/tm/net/tunnels/vxlan

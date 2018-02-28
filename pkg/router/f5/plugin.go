@@ -30,6 +30,12 @@ type F5PluginConfig struct {
 	// Host specifies the hostname or IP address of the F5 BIG-IP host.
 	Host string
 
+	// To verify against alternate CA certificates or a self-signed certificate with the CA flag.
+	CaBundle string
+
+	// To verify certificates with a hostname that does not match what is in the host field (above), put the certificate hostname here.
+	AltHostname string
+
 	// Username specifies the username with the plugin should authenticate
 	// with the F5 BIG-IP host.
 	Username string
@@ -38,6 +44,13 @@ type F5PluginConfig struct {
 	// authenticate with F5 BIG-IP.
 	Password string
 
+	// PartitionPath specifies the F5 partition path to use. This is used
+	// to create an access control boundary for users and applications.
+	PartitionPath string
+
+	// Enable VXLAN FDB programming.
+	EnableVxlan bool
+
 	// HttpVserver specifies the name of the vserver object in F5 BIG-IP that the
 	// plugin will configure for HTTP connections.
 	HttpVserver string
@@ -45,46 +58,20 @@ type F5PluginConfig struct {
 	// HttpsVserver specifies the name of the vserver object in F5 BIG-IP that the
 	// plugin will configure for HTTPS connections.
 	HttpsVserver string
-
-	// PrivateKey specifies the path to the SSH private-key file for
-	// authenticating with F5 BIG-IP.  The file must exist with this pathname
-	// inside the F5 router's filesystem namespace.  The F5 router requires this
-	// key to copy certificates and keys to the F5 BIG-IP host.
-	PrivateKey string
-
-	// Insecure specifies whether the F5 plugin should perform strict certificate
-	// validation for connections to the F5 BIG-IP host.
-	Insecure bool
-
-	// PartitionPath specifies the F5 partition path to use. This is used
-	// to create an access control boundary for users and applications.
-	PartitionPath string
-
-	// VxlanGateway is the ip address assigned to the local tunnel interface
-	// inside F5 box. This address is the one that the packets generated from F5
-	// will carry. The pods will return the packets to this address itself.
-	// It is important that the gateway be one of the ip addresses of the subnet
-	// that has been generated for F5.
-	VxlanGateway string
-
-	// InternalAddress is the ip address of the vtep interface used to connect to
-	// VxLAN overlay. It is the hostIP address listed in the subnet generated for F5
-	InternalAddress string
 }
 
 // NewF5Plugin makes a new f5 router plugin.
 func NewF5Plugin(cfg F5PluginConfig) (*F5Plugin, error) {
 	f5LTMCfg := f5LTMCfg{
 		host:            cfg.Host,
+		cabundle:        cfg.CaBundle,
+		althostname:     cfg.AltHostname,
 		username:        cfg.Username,
 		password:        cfg.Password,
+		partitionPath:   cfg.PartitionPath,
+		enableVxlan:     cfg.EnableVxlan,
 		httpVserver:     cfg.HttpVserver,
 		httpsVserver:    cfg.HttpsVserver,
-		privkey:         cfg.PrivateKey,
-		insecure:        cfg.Insecure,
-		partitionPath:   cfg.PartitionPath,
-		vxlanGateway:    cfg.VxlanGateway,
-		internalAddress: cfg.InternalAddress,
 	}
 	f5, err := newF5LTM(f5LTMCfg)
 	if err != nil {
@@ -102,7 +89,7 @@ func (p *F5Plugin) ensurePoolExists(poolname string) error {
 		return err
 	}
 
-	if !poolExists {
+	if ! poolExists {
 		err = p.F5Client.CreatePool(poolname)
 		if err != nil {
 			glog.V(4).Infof("Error creating pool %s: %v", poolname, err)
@@ -116,37 +103,48 @@ func (p *F5Plugin) ensurePoolExists(poolname string) error {
 // updatePool update the named pool (which must already exist in F5 BIG-IP) with
 // the given endpoints.
 func (p *F5Plugin) updatePool(poolname string, endpoints *kapi.Endpoints) error {
-	members, err := p.F5Client.GetPoolMembers(poolname)
+	// Check if the pool exists.
+	poolExists, err := p.F5Client.PoolExists(poolname)
 	if err != nil {
-		glog.V(4).Infof("F5Client.GetPoolMembers failed: %v", err)
+		glog.V(4).Infof("F5Client.PoolExists failed: %v", err)
 		return err
 	}
 
-	// We need to keep track of which endpoints already existed in F5 in order
-	// to delete any that no longer exist in the updated set of endpoints.
-	//
-	// It would be really nifty if F5 would just let us PUT the new list of
-	// endpoints to the pool members resource, bu-u-ut... it doesn't.   We can
-	// only manipulate the pool by POSTing and DELETEing individual pool members,
-	// so what we do is first POST things that should be in the pool but are not
-	// and then DELETE things that are in the pool but should not be.
-	//
-	// We use needToDelete to keep track of pool members.  First we assume that
-	// each pool member needs to be deleted (needToDelete[member] = true).  Then
-	// we iterate over the given endpoints and update needToDelete for each pool
-	// member that corresponds to one of those endpoints (needToDelete[dest]
-	// = false).  Finally we iterate over needToDelete and delete anything that is
-	// still marked for deletion (needToDelete[member] is true).
-	//
-	// Note that OpenShift issues many spurious notifications for updates when
-	// the endpoints set is actually the same, so we may ultimately end up
-	// adding and deleting 0 endpoints.
-
 	// Initialize needToDelete.
 	needToDelete := map[string]bool{}
-	for member := range members {
-		if members[member] {
-			needToDelete[member] = true
+
+	// Populate needToDelete.
+	if poolExists {
+		members, err := p.F5Client.GetPoolMembers(poolname)
+		if err != nil {
+			glog.V(4).Infof("F5Client.GetPoolMembers failed: %v", err)
+			return err
+		}
+
+		// We need to keep track of which endpoints already existed in F5 in order
+		// to delete any that no longer exist in the updated set of endpoints.
+		//
+		// It would be really nifty if F5 would just let us PUT the new list of
+		// endpoints to the pool members resource, bu-u-ut... it doesn't.   We can
+		// only manipulate the pool by POSTing and DELETEing individual pool members,
+		// so what we do is first POST things that should be in the pool but are not
+		// and then DELETE things that are in the pool but should not be.
+		//
+		// We use needToDelete to keep track of pool members.  First we assume that
+		// each pool member needs to be deleted (needToDelete[member] = true).  Then
+		// we iterate over the given endpoints and update needToDelete for each pool
+		// member that corresponds to one of those endpoints (needToDelete[dest]
+		// = false).  Finally we iterate over needToDelete and delete anything that is
+		// still marked for deletion (needToDelete[member] is true).
+		//
+		// Note that OpenShift issues many spurious notifications for updates when
+		// the endpoints set is actually the same, so we may ultimately end up
+		// adding and deleting 0 endpoints.
+
+		for member := range members {
+			if members[member] {
+				needToDelete[member] = true
+			}
 		}
 	}
 
@@ -244,16 +242,31 @@ func poolName(endpointsNamespace, endpointsName string) string {
 	return fmt.Sprintf("openshift_%s_%s", endpointsNamespace, endpointsName)
 }
 
+func (p *F5Plugin) checkActive() (bool, error) {
+	active, err := p.F5Client.CheckActive()
+	if (err == nil) && (! active) {
+		// TODO: Check that automatic sync is actually enabled.  If not, run a manual configsync on the devicegroup that /OpenShift partition is attached to, eg. after Commit()'ing the current changeset or in a similar place.
+		glog.V(4).Infof("Controlled BIG-IP is HA passive; assuming auto-sync from another unit will apply, skipping update.")
+	}
+	return active, err
+}
+
 // HandleEndpoints processes watch events on the Endpoints resource and
 // creates and deletes pools and pool members in response.
-func (p *F5Plugin) HandleEndpoints(eventType watch.EventType,
-	endpoints *kapi.Endpoints) error {
+func (p *F5Plugin) HandleEndpoints(eventType watch.EventType, endpoints *kapi.Endpoints) error {
 
-	glog.V(4).Infof("Processing %d Endpoints for Name: %v (%v)",
-		len(endpoints.Subsets), endpoints.Name, eventType)
+	glog.V(4).Infof("Processing %d Endpoints for Name: %v (%v)", len(endpoints.Subsets), endpoints.Name, eventType)
 
 	for i, s := range endpoints.Subsets {
 		glog.V(4).Infof("  Subset %d : %#v", i, s)
+	}
+
+	active, err := p.checkActive()
+	if err != nil {
+		return err
+	}
+	if ! active {
+		return nil
 	}
 
 	switch eventType {
@@ -270,7 +283,7 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType,
 			// a route associated though, the delete will fail and we will have to
 			// rely on HandleRoute to delete the pool when it deletes the route.
 
-			glog.V(4).Infof("Deleting endpoints for pool %s", poolname)
+			glog.V(4).Infof("Empty set of subnets for endpoint.  Deleting endpoints for pool %s", poolname)
 
 			err := p.updatePool(poolname, endpoints)
 			if err != nil {
@@ -289,7 +302,7 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType,
 				return err
 			}
 		} else {
-			glog.V(4).Infof("Updating endpoints for pool %s", poolname)
+			glog.V(4).Infof("Updating or adding endpoints for pool %s", poolname)
 
 			err := p.ensurePoolExists(poolname)
 			if err != nil {
@@ -409,11 +422,17 @@ func (p *F5Plugin) addRoute(routename, poolname, hostname, pathname string,
 			p.F5Client.AddReencryptRoute(routename, poolname, hostname)
 		}
 
-		// TODO(ramr):  need to handle redirect case for F5.
-		if tls.Termination == routeapi.TLSTerminationEdge &&
-			tls.InsecureEdgeTerminationPolicy == routeapi.InsecureEdgeTerminationPolicyAllow {
-			glog.V(4).Infof("Allowing insecure route %s for pool %s, hostname %s, pathname %s...",
-				routename, poolname, hostname, prettyPathname)
+		if tls.Termination == routeapi.TLSTerminationEdge && tls.InsecureEdgeTerminationPolicy == routeapi.InsecureEdgeTerminationPolicyRedirect {
+			glog.V(4).Infof("Add secure redirect for route %s pool %s, hostname %s, pathname %s", routename, poolname, hostname, prettyPathname)
+			err := p.F5Client.AddInsecureRedirectRoute(routename, poolname, hostname, pathname)
+			if err != nil {
+				glog.V(4).Infof("Error allowing redirect route for pool %s: %v", poolname, err)
+				return err
+			}
+		}
+
+		if tls.Termination == routeapi.TLSTerminationEdge && tls.InsecureEdgeTerminationPolicy == routeapi.InsecureEdgeTerminationPolicyAllow {
+			glog.V(4).Infof("Allowing insecure route %s for pool %s, hostname %s, pathname %s...", routename, poolname, hostname, prettyPathname)
 			err := p.F5Client.AddInsecureRoute(routename, poolname, hostname, pathname)
 			if err != nil {
 				glog.V(4).Infof("Error allowing insecure route for pool %s: %v", poolname, err)
@@ -443,7 +462,7 @@ func (p *F5Plugin) deleteRoute(routename string) error {
 
 		err := p.F5Client.DeleteCert(routename)
 		if err != nil {
-			f5err, ok := err.(F5Error)
+			f5err, ok := err.(RestError)
 			if ok && f5err.httpStatusCode == 404 {
 				glog.V(4).Infof("Secure route %s does not have TLS/SSL configured.",
 					routename)
@@ -458,7 +477,7 @@ func (p *F5Plugin) deleteRoute(routename string) error {
 		glog.V(4).Infof("Deleting secure route %s...", routename)
 		err = p.F5Client.DeleteSecureRoute(routename)
 		if err != nil {
-			f5err, ok := err.(F5Error)
+			f5err, ok := err.(RestError)
 			if ok && f5err.httpStatusCode == 404 {
 				glog.V(4).Infof("Secure route for %s does not exist.", routename)
 			} else {
@@ -479,7 +498,7 @@ func (p *F5Plugin) deleteRoute(routename string) error {
 		glog.V(4).Infof("Deleting insecure route %s...", routename)
 		err := p.F5Client.DeleteInsecureRoute(routename)
 		if err != nil {
-			f5err, ok := err.(F5Error)
+			f5err, ok := err.(RestError)
 			if ok && f5err.httpStatusCode == 404 {
 				glog.V(4).Infof("Insecure route for %s does not exist.", routename)
 			} else {
@@ -499,7 +518,7 @@ func (p *F5Plugin) deleteRoute(routename string) error {
 	if passthroughRouteExists {
 		err = p.F5Client.DeletePassthroughRoute(routename)
 		if err != nil {
-			f5err, ok := err.(F5Error)
+			f5err, ok := err.(RestError)
 			if ok && f5err.httpStatusCode == 404 {
 				glog.V(4).Infof("Passthrough route %s does not exist.",
 					routename)
@@ -520,7 +539,7 @@ func (p *F5Plugin) deleteRoute(routename string) error {
 		if reencryptRouteExists {
 			err = p.F5Client.DeleteReencryptRoute(routename)
 			if err != nil {
-				f5err, ok := err.(F5Error)
+				f5err, ok := err.(RestError)
 				if ok && f5err.httpStatusCode == 404 {
 					glog.V(4).Infof("Reencrypt route %s does not exist.",
 						routename)
@@ -566,6 +585,7 @@ func (p *F5Plugin) HandleNode(eventType watch.EventType, node *kapi.Node) error 
 		// if yes, then break, or just add the new vtep
 		uid := node.ObjectMeta.UID
 		if oldNodeIP, ok := p.VtepMap[uid]; ok && (oldNodeIP == ip) {
+			glog.V(4).Infof("Skipping update for node %s; IP and UID matches cached entry.", node.Name)
 			break
 		}
 		err = p.F5Client.AddVtep(ip)
@@ -595,10 +615,16 @@ func (p *F5Plugin) HandleNode(eventType watch.EventType, node *kapi.Node) error 
 
 // HandleRoute processes watch events on the Route resource and
 // creates and deletes policy rules in response.
-func (p *F5Plugin) HandleRoute(eventType watch.EventType,
-	route *routeapi.Route) error {
-	glog.V(4).Infof("Processing route for service: %v (%v)",
-		route.Spec.To, route)
+func (p *F5Plugin) HandleRoute(eventType watch.EventType, route *routeapi.Route) error {
+	glog.V(4).Infof("Processing route for service: %v (%v)", route.Spec.To, route)
+
+	active, err := p.checkActive()
+	if err != nil {
+		return err
+	}
+	if ! active {
+		return nil
+	}
 
 	// Name of the pool in F5.
 	poolname := poolName(route.Namespace, route.Spec.To.Name)
@@ -613,26 +639,6 @@ func (p *F5Plugin) HandleRoute(eventType watch.EventType,
 	routename := routeName(*route)
 
 	switch eventType {
-	case watch.Modified:
-		glog.V(4).Infof("Updating route %s...", routename)
-
-		err := p.deleteRoute(routename)
-		if err != nil {
-			return err
-		}
-
-		// Ensure the pool exists in case we have been told to modify a route that
-		// did not already exist.
-		err = p.ensurePoolExists(poolname)
-		if err != nil {
-			return err
-		}
-
-		err = p.addRoute(routename, poolname, hostname, pathname, route.Spec.TLS)
-		if err != nil {
-			return err
-		}
-
 	case watch.Deleted:
 
 		err := p.deleteRoute(routename)
@@ -645,7 +651,8 @@ func (p *F5Plugin) HandleRoute(eventType watch.EventType,
 			return err
 		}
 
-	case watch.Added:
+	case watch.Added, watch.Modified:
+		glog.V(4).Infof("Updating or adding route %s...", routename)
 
 		// F5 does not permit us to create a rule without a pool, so we need to
 		// create the pool here in HandleRoute if it does not already exist.
