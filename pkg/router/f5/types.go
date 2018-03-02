@@ -192,12 +192,19 @@ type f5RuleCondition struct {
 	// on a particular path segment from the request URI.
 	PathSegment bool `json:"pathSegment,omitempty"`
 
+	// Path, used with HttpUri, indicates that the condition must match
+	// on a particular path from the request URI.
+	Path bool `json:"path,omitempty"`
+
 	// Index indicates which component of an item (e.g., which segment of
 	// a path) this condition checks.
 	Index int `json:"index"`
 
 	// Equals indicates that the condition tests for equality.
 	Equals bool `json:"equals"`
+
+	// StartsWith indicates that the condition tests for a starts-with match.
+	StartsWith bool `json:"startsWith"`
 
 	// Request indicates that the rule matches on requests as opposed to
 	// responses.
@@ -327,8 +334,13 @@ type f5SslProfilePayload struct {
 	// Partition name.
 	Partition string `json:"partition"`
 
+	// Name to look for in certificate when validation, usually same as ServerName.
 	AuthenticateName string `json:"authenticateName,omitempty"`
+
+	// CA bundle to use for verifying signature in certificate.
 	CaFile string `json:"caFile,omitempty"`
+
+	// Either skip verification or abort the connectino if no certificate was received from server.
 	PeerCertMode string `json:"peerCertMode,omitempty"`
 }
 

@@ -372,11 +372,38 @@ func (f5 *f5LTM) iControlUriResourceId(resourceName string) string {
 }
 
 func isConflict(err error) bool {
-	return err.(RestError).httpStatusCode == http.StatusConflict
+	re, ok := err.(RestError)
+	if ! ok {
+		return false
+	}
+	return re.httpStatusCode == http.StatusConflict
 }
 
 func isGone(err error) bool {
-	return err.(RestError).httpStatusCode == http.StatusNotFound
+	re, ok := err.(RestError)
+	if ! ok {
+		return false
+	}
+	return re.httpStatusCode == http.StatusNotFound
+}
+
+func isReferenced(err error) bool {
+	re, ok := err.(RestError)
+	if ! ok {
+		return false
+	}
+	if re.Message == nil {
+		return false
+	}
+	// See K23011574 as reference to error code.
+	if ! strings.HasPrefix(*re.Message, "01070265:3:") {
+		return false
+	}
+	return re.httpStatusCode == http.StatusBadRequest
+}
+
+func (f5 *f5LTM) IsReferenced(err error) bool {
+	return isReferenced(err)
 }
 
 //
@@ -874,32 +901,74 @@ func (f5 *f5LTM) addRoute(policyname, routename, poolname, hostname, pathname st
 		return err
 	}
 
-	if pathname != "" {
-		//
-		// TODO: untested for pathname != "" scenario.  Does below code path fail if the segments already exist?
-		//       likely not, it will likely work for eg. /a/b --> /c/d, but it might very well fail on shortening, ie. /a/b/c --> /a/b
-		//
-		// Each segment of the pathname must be added to the rule as a separate condition.
-		segments := strings.Split(pathname, "/")
-		conditionPayload.HttpHost = false
-		conditionPayload.Host = false
-		conditionPayload.HttpUri = true
-		conditionPayload.PathSegment = true
-		for i, segment := range segments[1:] {
-			if segment == "" {
-				continue
-			}
-			idx := fmt.Sprintf("%d", i+1)
-			conditionPayload.Name = idx
-			conditionPayload.Index = i + 1
+	// Split path into segments.
+	segments := strings.Split(pathname, "/")
+
+	// Remove any empty trailing segments by snipping last element until
+	// non-empty segment encountered or just left-most segment is left.
+	for {
+		if len(segments) <= 1 {
+			break
+		}
+		if len(segments[len(segments) - 1]) > 0 {
+			break
+		}
+		segments = append(segments[:len(segments) - 1])
+	}
+
+	// Remove segment 0; it is always empty, since OpenShift enforces paths starting with a forward slash.
+	if len(segments) > 0 {
+		segments = segments[1:]
+	}
+
+	// Reset condition payload and set HTTP URI matching flag.
+	conditionPayload.HttpHost = false
+	conditionPayload.Host = false
+	conditionPayload.HttpUri = true
+
+	// Each segment of the pathname is added to the rule as a separate condition.
+	for i, segment := range segments {
+		conditionPayload.Name = fmt.Sprintf("%d", i + 1)
+		if segment == "" {
+			// A no-op condition is necessary for later updates to work correctly.
+			conditionPayload.PathSegment = false
+			conditionPayload.Equals = false
+			conditionPayload.Path = true
+			conditionPayload.StartsWith = true
+			conditionPayload.Values = []string{"/"}
+			conditionPayload.Index = 0
+		} else {
+			// Regular path segment.
+			conditionPayload.PathSegment = true
+			conditionPayload.Equals = true
+			conditionPayload.Path = false
+			conditionPayload.StartsWith = false
 			conditionPayload.Values = []string{segment}
-			glog.Infof("Adding/updating condition segment %s.", segment)
-			err = f5.post(conditionUrl, conditionPayload, nil)
-			if err != nil {
-				glog.Warningf("Failed to add/update condition segment: %s", err.Error())
+			conditionPayload.Index = i + 1
+		}
+		glog.Infof("Adding/updating condition segment %d: %s.", i + 1, segment)
+		err = f5.post(conditionUrl, conditionPayload, nil)
+		if err != nil {
+			glog.Warningf("Failed to add/update condition segment: %s", err.Error())
+			return err
+		}
+	}
+
+	// During update, remove any superfluous segment conditions from before the update.
+	i := len(segments)
+	for {
+		segmentUrl := fmt.Sprintf("https://%s/mgmt/tm/ltm/policy/%s/rules/%s/conditions/%d", f5.host, policyResourceId, routename, i + 1)
+		glog.Infof("Deleting condition segment %d.", i + 1)
+		err = f5.delete(segmentUrl, nil)
+		if err != nil {
+			if ! isGone(err) {
+				glog.Warningf("Failed to delete condition segment: %s", err.Error())
 				return err
+			} else {
+				break
 			}
 		}
+		i++
 	}
 
 	actionUrl := fmt.Sprintf("https://%s/mgmt/tm/ltm/policy/%s/rules/%s/actions", f5.host, policyResourceId, routename)

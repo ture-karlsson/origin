@@ -275,13 +275,21 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType, endpoints *kapi.En
 		poolname := poolName(endpoints.Namespace, endpoints.Name)
 
 		if len(endpoints.Subsets) == 0 {
-			// F5 does not permit us to delete a pool if it has a rule associated with
-			// it.  However, a pool does not necessarily have a rule associated with
+			// LTM does not permit us to delete a pool if something is pointing
+			// to it, eg. an LTM policy rule.
+			//
+			// However, a pool does not necessarily have a rule associated with
 			// it because it may be from a service for which no route was created.
-			// Thus we first delete the endpoints from the pool, then we try to delete
-			// the pool, in case there is no route associated, but if there *is*
-			// a route associated though, the delete will fail and we will have to
-			// rely on HandleRoute to delete the pool when it deletes the route.
+			//
+			// We first delete the endpoints from the pool.
+			//
+			// Then we try to delete the pool, in case there is no route associated
+			// (but then again should it not be there, if pool creation is related
+			// to the existence of a service?)
+			//
+			// But if there *is* a route associated though, the delete will fail and
+			// we will have to rely on HandleRoute to delete the pool when it deletes
+			// the route.
 
 			glog.V(4).Infof("Empty set of subnets for endpoint.  Deleting endpoints for pool %s", poolname)
 
@@ -292,14 +300,16 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType, endpoints *kapi.En
 
 			glog.V(4).Infof("Deleting pool %s", poolname)
 
-			// Note: deletePool will throw errors if the route
-			//       has not been deleted as the policy would
-			//       still refer to the pool. That is ok as the
-			//       pool will still get deleted when the route
-			//       gets deleted.
 			err = p.deletePool(poolname)
 			if err != nil {
-				return err
+				// Note: deletePool will throw errors if the route
+				//       has not been deleted as the policy would
+				//       still refer to the pool. That is ok as the
+				//       pool will still get deleted when the route
+				//       gets deleted.
+				if ! p.F5Client.IsReferenced(err) {
+					return err
+				}
 			}
 		} else {
 			glog.V(4).Infof("Updating or adding endpoints for pool %s", poolname)
