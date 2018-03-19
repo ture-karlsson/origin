@@ -7,11 +7,20 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os/exec"
 	"path"
 	"reflect"
 	"strings"
 	"testing"
+	"strconv"
+	"io/ioutil"
+	"bytes"
+	"encoding/pem"
+	"crypto/x509"
+	"crypto/rsa"
+	"crypto/rand"
+	"crypto/x509/pkix"
+	"time"
+	"math/big"
 
 	"github.com/gorilla/mux"
 	"github.com/openshift/origin/pkg/cmd/util"
@@ -26,6 +35,9 @@ type (
 	// mockF5State stores the state necessary to mock the functionality of an F5
 	// BIG-IP host that the F5 router uses.
 	mockF5State struct {
+		// uploaded files
+		uploads map[string]upload
+
 		// policies is the set of policies that exist in the mock F5 host.
 		policies map[string]map[string]policyRule
 
@@ -105,6 +117,9 @@ type (
 	// strings to strings.
 	datagroup map[string]string
 
+	// An uploaded file
+	upload []byte
+
 	// An iRule comprises a string of TCL code.
 	iRule string
 
@@ -132,16 +147,9 @@ const (
 	httpsVserverName              = "https-ose-vserver"
 	insecureRoutesPolicyName      = "openshift_insecure_routes"
 	secureRoutesPolicyName        = "openshift_secure_routes"
-	passthroughIRuleName          = "openshift_passthrough_irule"
+	passthroughIRuleName          = "openshift_ssl_strategy"
 	passthroughIRuleDatagroupName = "ssl_passthrough_servername_dg"
 )
-
-func mockExecCommand(command string, args ...string) *exec.Cmd {
-	// TODO: Parse ssh and scp commands in order to keep track of what files are
-	// being uploaded so that we can perform more validations in HTTP handlers in
-	// the mock F5 host that use files uploaded via SSH.
-	return exec.Command("true")
-}
 
 type Route struct {
 	Name        string
@@ -151,6 +159,9 @@ type Route struct {
 }
 
 var f5Routes = []Route{
+	{"getGlobalSettings", "GET", "/mgmt/tm/sys/global-settings", getGlobalSettingsHandler},
+	{"getTrafficGroupStats", "GET", "/mgmt/tm/cm/traffic-group/{trafficGroupName}/stats", getTrafficGroupStatsHandler},
+	{"uploadFile", "POST", "/mgmt/shared/file-transfer/uploads/{fileName}", uploadFileHandler},
 	{"getPolicy", "GET", "/mgmt/tm/ltm/policy/{policyName}", getPolicyHandler},
 	{"postPolicy", "POST", "/mgmt/tm/ltm/policy", postPolicyHandler},
 	{"postRule", "POST", "/mgmt/tm/ltm/policy/{policyName}/rules", postRuleHandler},
@@ -208,25 +219,31 @@ func newTestRouterWithState(state mockF5State, partitionPath string) (*F5Plugin,
 		flag.Set("v", routerLogLevel)
 	}
 
-	execCommand = mockExecCommand
-
 	server := httptest.NewTLSServer(newF5Routes(state))
 
 	url, err := url.Parse(server.URL)
 	if err != nil {
-		return nil, nil,
-			fmt.Errorf("Failed to parse URL of mock F5 host; URL: %s, error: %v",
-				url, err)
+		return nil, nil, fmt.Errorf("Failed to parse URL of mock F5 host; URL: %s, error: %v", url, err)
 	}
+
+	block := &pem.Block{
+		Type: "CERTIFICATE",
+		Bytes: server.Certificate().Raw,
+	}
+	var out bytes.Buffer
+	pem.Encode(&out, block)
+	ca :=out.String()
+
+	host := server.Certificate().DNSNames[0]
 
 	f5PluginTestCfg := F5PluginConfig{
 		Host:          url.Host,
+		CaBundle:      ca,
+		AltHostname:   host,
 		Username:      "admin",
 		Password:      "password",
 		HttpVserver:   httpVserverName,
 		HttpsVserver:  httpsVserverName,
-		PrivateKey:    "/dev/null",
-		Insecure:      true,
 		PartitionPath: partitionPath,
 	}
 	router, err := NewF5Plugin(f5PluginTestCfg)
@@ -243,10 +260,13 @@ func newTestRouterWithState(state mockF5State, partitionPath string) (*F5Plugin,
 // returns pointers to the plugin and mock server.  Note that these pointers
 // will be nil if an error is returned.
 func newTestRouter(partitionPath string) (*F5Plugin, *mockF5, error) {
+	commonPartition := "/Common"
+	commonPathKey := strings.Replace(commonPartition, "/", "~", -1)
 	pathKey := strings.Replace(partitionPath, "/", "~", -1)
 	httpVserverPath := path.Join(partitionPath, httpVserverName)
 	httpsVserverPath := path.Join(partitionPath, httpsVserverName)
 	state := mockF5State{
+		uploads: map[string]upload{},
 		policies: map[string]map[string]policyRule{},
 		vserverPolicies: map[string]map[string]bool{
 			httpVserverPath:  {},
@@ -263,10 +283,39 @@ func newTestRouter(partitionPath string) (*F5Plugin, *mockF5, error) {
 		iRules:        map[string]iRule{},
 		vserverIRules: map[string][]string{},
 
-		// Add the default /Common partition path.
-		partitionPaths: map[string]string{pathKey: partitionPath},
+		partitionPaths: map[string]string{},
 		pools:          map[string]pool{},
 	}
+
+	// BEGIN: assumed to have been performed by tooling.
+
+	// Add the default /Common partition path.
+	state.partitionPaths[commonPartition] = commonPathKey
+
+	// Add the /OpenShift partition path.
+	state.partitionPaths[partitionPath] = pathKey
+
+	// Add the datagroups.
+	state.datagroups["/OpenShift/ssl_passthrough_servername_dg"] = datagroup{}
+	state.datagroups["/OpenShift/ssl_passthrough_route_dg"] = datagroup{}
+	state.datagroups["/OpenShift/ssl_reencrypt_servername_dg"] = datagroup{}
+	state.datagroups["/OpenShift/ssl_reencrypt_route_dg"] = datagroup{}
+
+	// Add the policies.
+	state.policies["/OpenShift/openshift_insecure_routes"] = map[string]policyRule{"default_noop":{conditions:[]policyCondition{}}}
+	state.policies["/OpenShift/openshift_secure_routes"] = map[string]policyRule{"default_noop":{conditions:[]policyCondition{}}}
+
+	// Bind the policies.
+	state.vserverPolicies[httpVserverPath] = map[string]bool{"/OpenShift/openshift_insecure_routes":true}
+	state.vserverPolicies[httpsVserverPath] = map[string]bool{"/OpenShift/openshift_secure_routes":true}
+
+	// Add iRules.
+	state.iRules["/OpenShift/openshift_ssl_strategy"] = "---blah ssl_passthrough_servername_dg blah---"
+
+	// Bind iRules.
+	state.vserverIRules[httpsVserverPath] = []string{"/OpenShift/openshift_ssl_strategy"}
+
+	// END: assumed to have been performed by tooling.
 
 	return newTestRouterWithState(state, partitionPath)
 }
@@ -320,6 +369,12 @@ func validatePolicy(response http.ResponseWriter, request *http.Request,
 	}
 
 	return true
+}
+
+func getGlobalSettingsHandler(f5state mockF5State) http.HandlerFunc {
+	return func(response http.ResponseWriter, request *http.Request) {
+		fmt.Fprintf(response, `{"hostname":"bigip1.example.com","kind":"tm:sys:global-settings"}`)
+	}
 }
 
 func getPolicyHandler(f5state mockF5State) http.HandlerFunc {
@@ -727,7 +782,7 @@ func getPartitionPath(f5state mockF5State) http.HandlerFunc {
 
 		fullPath := f5state.partitionPaths[partition.id()]
 		fmt.Fprintf(response,
-			`{"deviceGroup":"%s/ose-sync-failover","fullPath":"%s","generation":580,"hidden":"false","inheritedDevicegroup":"true","inheritedTrafficGroup":"true","kind":"tm:sys:folder:folderstate","name":"%s","noRefCheck":"false","selfLink":"https://localhost/mgmt/tm/sys/folder/%s?ver=11.6.0","subPath":"/"}`,
+			`{"deviceGroup":"%s/ose-sync-failover","trafficGroup":"/Common/traffic-group-1","fullPath":"%s","generation":580,"hidden":"false","inheritedDevicegroup":"true","inheritedTrafficGroup":"true","kind":"tm:sys:folder:folderstate","name":"%s","noRefCheck":"false","selfLink":"https://localhost/mgmt/tm/sys/folder/%s?ver=11.6.0","subPath":"/"}`,
 			fullPath, fullPath, partition.Name, encodeiControlUriPathComponent(fullPath))
 	}
 }
@@ -890,6 +945,74 @@ func deletePoolMemberHandler(f5state mockF5State) http.HandlerFunc {
 	}
 }
 
+func uploadFileHandler(f5state mockF5State) http.HandlerFunc {
+	return func(response http.ResponseWriter, request *http.Request) {
+		vars := mux.Vars(request)
+		fn := vars["fileName"]
+
+		cr := request.Header.Get("Content-Range")
+		parts1 := strings.SplitN(cr, "/", 2)
+		parts2 := strings.SplitN(parts1[0], "-", 2)
+
+		if (cr == "") || (len(parts1) < 2) || (len(parts2) < 2) {
+			response.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(response,
+				`{"code":400,"message":"Missing 'Content-Range' header","referer":"localhost","restOperationId":10432519,"kind":":resterrorresponse"}`,
+			)
+			return
+		}
+
+		totalSize, _ := strconv.Atoi(parts1[1])
+		firstByte, _ := strconv.Atoi(parts2[0])
+		lastByte, _ := strconv.Atoi(parts2[1])
+
+		chunkSize := lastByte - firstByte + 1
+
+		//fmt.Printf("DEBUG: Receiving chunk from byte %d to byte %d of file %s, %d bytes of expected total size %d\n", firstByte, lastByte, fn, chunkSize, totalSize)
+
+		remainingBytes := totalSize - chunkSize
+
+		body, _ := ioutil.ReadAll(request.Body)
+		receivedBytes := len(body)
+
+		if receivedBytes < chunkSize {
+			response.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(response, ``)
+			return
+		}
+
+		// TODO: Handle multiple chunks.
+
+		tempFileName := path.Join("/var/config/rest/downloads/tmp/", fn)
+		finalFileName := path.Join("/var/config/rest/downloads/", fn)
+
+		fmt.Fprintf(response,
+			`{"remainingByteCount":%d,"usedChunks":{"0":%d},"totalByteCount":%d,"localFilePath":"%s","temporaryFilePath":"%s","generation":0,"lastUpdateMicros":1500000000000000}`,
+			remainingBytes,
+			chunkSize,
+			totalSize,
+			finalFileName,
+			tempFileName,
+		)
+
+		f5state.uploads[finalFileName] = body
+	}
+}
+
+func getTrafficGroupStatsHandler(f5state mockF5State) http.HandlerFunc {
+	return func(response http.ResponseWriter, request *http.Request) {
+		vars := mux.Vars(request)
+		tg := vars["trafficGroupName"]
+
+		fmt.Fprintf(response,
+			`{"kind":"tm:cm:traffic-group:traffic-groupstats","generation":25315,"selfLink":"https://localhost/mgmt/tm/cm/traffic-group/%s/stats?ver=11.6.0","entries":{"https://localhost/mgmt/tm/cm/traffic-group/%s/%s:~Common~bigip1.example.com/stats":{"nestedStats":{"kind":"tm:cm:traffic-group:traffic-groupstats","selfLink":"https://localhost/mgmt/tm/cm/traffic-group/%s/%s:~Common~bigip1.example.com/stats?ver=11.6.0","entries":{"deviceName":{"description":"/Common/bigip1.example.com"},"failoverState":{"description":"active"},"nextActive":{"description":"false"},"trafficGroup":{"description":"/Common/traffic-group-1"}}}},"https://localhost/mgmt/tm/cm/traffic-group/%s/%s:~Common~bigip2.example.com/stats":{"nestedStats":{"kind":"tm:cm:traffic-group:traffic-groupstats","selfLink":"https://localhost/mgmt/tm/cm/traffic-group/%s/%s:~Common~bigip2.example.com/stats?ver=11.6.0","entries":{"deviceName":{"description":"/Common/bigip2.example.com"},"failoverState":{"description":"standby"},"nextActive":{"description":"true"},"trafficGroup":{"description":"/Common/traffic-group-1"}}}}}}`,
+			tg, tg, tg,
+			tg, tg, tg,
+			tg, tg, tg,
+		)
+	}
+}
+
 func getRulesHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		vars := mux.Vars(request)
@@ -1018,19 +1141,39 @@ func postSslCertHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		payload := struct {
 			Name string `json:"name"`
+			Partition string `json:"partition"`
+			Filename string `json:"from-local-file"`
 		}{}
 		decoder := json.NewDecoder(request.Body)
 		decoder.Decode(&payload)
 
 		certName := payload.Name
+		certNameFull := path.Join("/", payload.Partition, fmt.Sprintf("%s.crt", certName))
 
-		// TODO: Validate filename (which would require more elaborate mocking of
-		// the ssh and scp commands in mockExecCommand).
+		data := f5state.uploads[payload.Filename]
+
+		// Verify that the uploaded file parses as x509, since BIG-IP does.
+		good := false
+		block, _ := pem.Decode(data)
+		if block != nil && block.Type == "CERTIFICATE" {
+			_, err := x509.ParseCertificates(block.Bytes)
+			if err == nil {
+				good = true
+			}
+		}
+		if ! good {
+			response.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(response,
+				`{"code":400,"message":"01070712:3: unable to validate certificate, invalid x509 file.","errorStack":[]}`)
+			return
+		}
+
+		//fmt.Printf("DEBUG: Installed certificate %s\n", certNameFull)
 
 		// F5 adds the extension to the filename specified in the payload, and this
 		// extension must be included in subsequent REST calls that reference the
 		// file.
-		f5state.certs[fmt.Sprintf("%s.crt", certName)] = true
+		f5state.certs[certNameFull] = true
 
 		OK(response)
 	}
@@ -1040,16 +1183,44 @@ func postSslKeyHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		payload := struct {
 			Name string `json:"name"`
+			Partition string `json:"partition"`
+			Filename string `json:"from-local-file"`
 		}{}
 		decoder := json.NewDecoder(request.Body)
 		decoder.Decode(&payload)
 
 		keyName := payload.Name
+		keyNameFull := path.Join("/", payload.Partition, fmt.Sprintf("%s.key", keyName))
 
-		// TODO: Validate filename (which would require more elaborate mocking of
-		// the ssh and scp commands in mockExecCommand).
+		data := f5state.uploads[payload.Filename]
 
-		f5state.keys[fmt.Sprintf("%s.key", keyName)] = true
+		// Verify that the uploaded file parses as x509, since BIG-IP does.
+		good := false
+		block, _ := pem.Decode(data)
+		if block != nil {
+			if block.Type == "PRIVATE KEY" {
+				_, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+				if err == nil {
+					good = true
+				}
+			}
+			if block.Type == "EC PRIVATE KEY" {
+				_, err := x509.ParseECPrivateKey(block.Bytes)
+				if err == nil {
+					good = true
+				}
+			}
+		}
+		if ! good {
+			response.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(response,
+				`{"code":400,"message":"01070712:3: unable to validate key, invalid x509 file.","errorStack":[]}`)
+			return
+		}
+
+		//fmt.Printf("DEBUG: Installed key %s\n", keyNameFull)
+
+		f5state.keys[keyNameFull] = true
 
 		OK(response)
 	}
@@ -1088,20 +1259,20 @@ func postClientSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 			CertificateName string `json:"cert"`
 			KeyName         string `json:"key"`
 			Name            string `json:"name"`
+			Partition       string `json:"partition"`
 		}{}
 		decoder := json.NewDecoder(request.Body)
 		decoder.Decode(&payload)
 
-		keyName := payload.KeyName
-		certificateName := payload.CertificateName
-		clientSslProfileName := payload.Name
-
+		keyName := path.Join("/", payload.Partition, payload.KeyName)
+		certificateName := path.Join("/", payload.Partition, payload.CertificateName)
+		clientSslProfileName := path.Join("/", payload.Partition, payload.Name)
 		// Complain about name collision first because F5 does.
 		_, clientSslProfileAlreadyExists := f5state.clientSslProfiles[clientSslProfileName]
 		if clientSslProfileAlreadyExists {
 			response.WriteHeader(http.StatusConflict)
 			fmt.Fprintf(response,
-				`{"code":409,"message":"01020066:3: The requested ClientSSL Profile (/Common/%s) already exists in partition Common.","errorStack":[]`,
+				`{"code":409,"message":"01020066:3: The requested ClientSSL Profile (%s) already exists in partition Common.","errorStack":[]`,
 				clientSslProfileName)
 			return
 		}
@@ -1123,11 +1294,10 @@ func postClientSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 		if serverSslProfileAlreadyExists {
 			response.WriteHeader(http.StatusConflict)
 			fmt.Fprintf(response,
-				`{"code":400,"message":"01070293:3: The profile name (/Common/%s) is already assigned to another profile.","errorStack":[]}`,
+				`{"code":400,"message":"01070293:3: The profile name (%s) is already assigned to another profile.","errorStack":[]}`,
 				clientSslProfileName)
 			return
 		}
-
 		f5state.clientSslProfiles[clientSslProfileName] = true
 
 		OK(response)
@@ -1137,13 +1307,13 @@ func postClientSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 func deleteClientSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		vars := mux.Vars(request)
-		clientSslProfileName := vars["profileName"]
+		clientSslProfileName := normalizeiControlUriPath(vars["profileName"])
 
 		_, clientSslProfileFound := f5state.clientSslProfiles[clientSslProfileName]
 		if !clientSslProfileFound {
 			response.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(response,
-				`{"code":404,"message":"01020036:3: The requested ClientSSL Profile (/Common/%s) was not found.","errorStack":[]}`,
+				`{"code":404,"message":"01020036:3: The requested ClientSSL Profile (%s) was not found.","errorStack":[]}`,
 				clientSslProfileName)
 			return
 		}
@@ -1171,21 +1341,22 @@ func validateServerKey(response http.ResponseWriter, request *http.Request,
 func postServerSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		payload := struct {
-			CertificateName string `json:"chain"`
+			CertificateName string `json:"caFile"`
 			Name            string `json:"name"`
+			Partition       string `json:"partition"`
 		}{}
 		decoder := json.NewDecoder(request.Body)
 		decoder.Decode(&payload)
 
-		certificateName := payload.CertificateName
-		serverSslProfileName := payload.Name
+		certificateName := path.Join("/", payload.Partition, payload.CertificateName)
+		serverSslProfileName := path.Join("/", payload.Partition, payload.Name)
 
 		// Complain about name collision first because F5 does.
 		_, serverSslProfileAlreadyExists := f5state.serverSslProfiles[serverSslProfileName]
 		if serverSslProfileAlreadyExists {
 			response.WriteHeader(http.StatusConflict)
 			fmt.Fprintf(response,
-				`{"code":409,"message":"01020066:3: The requested ServerSSL Profile (/Common/%s) already exists in partition Common.","errorStack":[]}`,
+				`{"code":409,"message":"01020066:3: The requested ServerSSL Profile (%s) already exists in partition Common.","errorStack":[]}`,
 				serverSslProfileName)
 			return
 		}
@@ -1194,7 +1365,7 @@ func postServerSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 		if clientSslProfileAlreadyExists {
 			response.WriteHeader(http.StatusConflict)
 			fmt.Fprintf(response,
-				`{"code":400,"message":"01070293:3: The profile name (/Common/%s) is already assigned to another profile.","errorStack":[]}`,
+				`{"code":400,"message":"01070293:3: The profile name (%s) is already assigned to another profile.","errorStack":[]}`,
 				serverSslProfileName)
 			return
 		}
@@ -1212,13 +1383,13 @@ func postServerSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 func deleteServerSslProfileHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		vars := mux.Vars(request)
-		serverSslProfileName := vars["profileName"]
+		serverSslProfileName := normalizeiControlUriPath(vars["profileName"])
 
 		_, serverSslProfileFound := f5state.serverSslProfiles[serverSslProfileName]
 		if !serverSslProfileFound {
 			response.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(response,
-				`{"code":404,"message":"01020036:3: The requested ServerSSL Profile (/Common/%s) was not found.","errorStack":[]}`,
+				`{"code":404,"message":"01020036:3: The requested ServerSSL Profile (%s) was not found.","errorStack":[]}`,
 				serverSslProfileName)
 			return
 		}
@@ -1256,7 +1427,7 @@ func deleteSslVserverProfileHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		vars := mux.Vars(request)
 		vserver := newMockF5iControlResource("vserver", vars["vserverName"])
-		profileName := vars["profileName"]
+		profileName := normalizeiControlUriPath(vars["profileName"])
 
 		if !validateVserver(response, request, f5state, vserver) {
 			return
@@ -1271,20 +1442,20 @@ func deleteSslVserverProfileHandler(f5state mockF5State) http.HandlerFunc {
 func deleteSslKeyHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		vars := mux.Vars(request)
-		keyName := vars["keyName"]
+		keyName := normalizeiControlUriPath(vars["keyName"])
 
 		_, keyFound := f5state.keys[keyName]
 		if !keyFound {
 			response.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(response,
-				`{"code":404,"message":"01020036:3: The requested Certificate Key File (/Common/%s) was not found.","errorStack":[]}`,
+				`{"code":404,"message":"01020036:3: The requested Certificate Key File (%s) was not found.","errorStack":[]}`,
 				keyName)
 			return
 		}
 
 		// TODO: Validate that the key is not in use (which will require keeping
 		// track of more state).
-		//{"code":400,"message":"01071349:3: File object by name (/Common/%s) is in use.","errorStack":[]}
+		//{"code":400,"message":"01071349:3: File object by name (%s) is in use.","errorStack":[]}
 
 		delete(f5state.keys, keyName)
 
@@ -1295,20 +1466,20 @@ func deleteSslKeyHandler(f5state mockF5State) http.HandlerFunc {
 func deleteSslCertHandler(f5state mockF5State) http.HandlerFunc {
 	return func(response http.ResponseWriter, request *http.Request) {
 		vars := mux.Vars(request)
-		certName := vars["certName"]
+		certName := normalizeiControlUriPath(vars["certName"])
 
 		_, certFound := f5state.certs[certName]
 		if !certFound {
 			response.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(response,
-				`{"code":404,"message":"01020036:3: The requested Certificate File (/Common/%s) was not found.","errorStack":[]}`,
+				`{"code":404,"message":"01020036:3: The requested Certificate File (%s) was not found.","errorStack":[]}`,
 				certName)
 			return
 		}
 
 		// TODO: Validate that the key is not in use (which will require keeping
 		// track of more state).
-		//{"code":400,"message":"01071349:3: File object by name (/Common/openshift_route_default_route-reencrypt-https-cert.crt) is in use.","errorStack":[]}
+		//{"code":400,"message":"01071349:3: File object by name (%s) is in use.","errorStack":[]}
 
 		delete(f5state.certs, certName)
 
@@ -1382,6 +1553,7 @@ func TestInitializeF5Plugin(t *testing.T) {
 	if !foundPassthroughIRuleDatagroup {
 		t.Errorf("%s datagroup was not created.", passthroughIRuleDatagroupName)
 	}
+
 
 	// The passthrough iRule should exist and should reference the datagroup for
 	// passthrough routes.
@@ -1591,6 +1763,8 @@ func TestHandleEndpoints(t *testing.T) {
 				return nil
 			},
 		},
+		// TODO: Likely fails because empty subset no longer causes pool removal -- see fix for pool member mixup aka issue #19.
+		// Maybe this test should be dropped?  Or should there still be pool removal under HandleEndpoints() ?
 		{
 			name:      "Endpoint delete",
 			eventType: watch.Modified,
@@ -1629,6 +1803,40 @@ func TestHandleEndpoints(t *testing.T) {
 	}
 }
 
+func dummyX509Objects() (key, cert []byte) {
+	dummyKeyBlob, _ := rsa.GenerateKey(rand.Reader, 2048)
+	var dummyKeyBlock = &pem.Block{
+		Type: "PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(dummyKeyBlob),
+	}
+	dummyKey := pem.EncodeToMemory(dummyKeyBlock)
+
+	template := x509.Certificate{
+		SerialNumber: new(big.Int),
+		Subject: pkix.Name{
+			Organization: []string{"Org"},
+		},
+		NotBefore: time.Now(),
+		NotAfter: time.Now(),
+		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA: true,
+		DNSNames: []string{"test.example.com"},
+	}
+	dummyCertBlob, _ := x509.CreateCertificate(rand.Reader, &template, &template, &dummyKeyBlob.PublicKey, dummyKeyBlob)
+	var dummyCertBlock = &pem.Block{
+		Type: "CERTIFICATE",
+		Bytes: dummyCertBlob,
+	}
+	dummyCert := pem.EncodeToMemory(dummyCertBlock)
+
+	//fmt.Printf("DEBUG: key=\n%s\n", string(dummyKey))
+	//fmt.Printf("DEBUG: cert=\n%s\n", string(dummyCert))
+
+	return dummyKey, dummyCert
+}
+
 // TestHandleRoute test route watch events and validates that the state of the
 // F5 client object is as expected after each event.
 func TestHandleRoute(t *testing.T) {
@@ -1655,6 +1863,8 @@ func TestHandleRoute(t *testing.T) {
 		// expected.
 		validate func(tc testCase) error
 	}
+
+	dummyKey, dummyCert := dummyX509Objects()
 
 	testCases := []testCase{
 		{
@@ -1811,12 +2021,13 @@ func TestHandleRoute(t *testing.T) {
 					},
 					TLS: &routeapi.TLSConfig{
 						Termination: routeapi.TLSTerminationEdge,
-						Certificate: "abc",
-						Key:         "def",
+						Certificate: string(dummyCert),
+						Key:         string(dummyKey),
 					},
 				},
 			},
 			validate: func(tc testCase) error {
+				foldername := F5DefaultPartitionPath
 				rulename := routeName(*tc.route)
 				policy := newMockF5iControlResource("policy", secureRoutesPolicyName)
 
@@ -1828,7 +2039,7 @@ func TestHandleRoute(t *testing.T) {
 						mockF5.state.policies[policy.id()])
 				}
 
-				certfname := fmt.Sprintf("%s-https-cert.crt", rulename)
+				certfname := fmt.Sprintf("%s/%s-https-cert.crt", foldername, rulename)
 				_, found = mockF5.state.certs[certfname]
 				if !found {
 					return fmt.Errorf("Certificate file %s should have been created but"+
@@ -1836,7 +2047,7 @@ func TestHandleRoute(t *testing.T) {
 						certfname, mockF5.state.certs)
 				}
 
-				keyfname := fmt.Sprintf("%s-https-key.key", rulename)
+				keyfname := fmt.Sprintf("%s/%s-https-key.key", foldername, rulename)
 				_, found = mockF5.state.keys[keyfname]
 				if !found {
 					return fmt.Errorf("Key file %s should have been created but"+
@@ -1844,7 +2055,7 @@ func TestHandleRoute(t *testing.T) {
 						keyfname, mockF5.state.keys)
 				}
 
-				clientSslProfileName := fmt.Sprintf("%s-client-ssl-profile", rulename)
+				clientSslProfileName := fmt.Sprintf("%s/%s-client-ssl-profile", foldername, rulename)
 				_, found = mockF5.state.clientSslProfiles[clientSslProfileName]
 				if !found {
 					return fmt.Errorf("client-ssl profile %s should have been created"+
@@ -1879,8 +2090,8 @@ func TestHandleRoute(t *testing.T) {
 					},
 					TLS: &routeapi.TLSConfig{
 						Termination: routeapi.TLSTerminationEdge,
-						Certificate: "abc",
-						Key:         "def",
+						Certificate: string(dummyCert),
+						Key:         string(dummyKey),
 					},
 				},
 			},
@@ -1979,8 +2190,8 @@ func TestHandleRoute(t *testing.T) {
 					},
 					TLS: &routeapi.TLSConfig{
 						Termination: routeapi.TLSTerminationEdge,
-						Certificate: "abc",
-						Key:         "def",
+						Certificate: string(dummyCert),
+						Key:         string(dummyKey),
 					},
 				},
 			},
@@ -2103,14 +2314,15 @@ func TestHandleRoute(t *testing.T) {
 					},
 					TLS: &routeapi.TLSConfig{
 						Termination:              routeapi.TLSTerminationReencrypt,
-						Certificate:              "abc",
-						Key:                      "def",
-						CACertificate:            "ghi",
-						DestinationCACertificate: "jkl",
+						Certificate:              string(dummyCert),
+						Key:                      string(dummyKey),
+						CACertificate:            string(dummyCert),
+						DestinationCACertificate: string(dummyCert),
 					},
 				},
 			},
 			validate: func(tc testCase) error {
+				foldername := F5DefaultPartitionPath
 				rulename := routeName(*tc.route)
 				policy := newMockF5iControlResource("policy", secureRoutesPolicyName)
 
@@ -2122,7 +2334,7 @@ func TestHandleRoute(t *testing.T) {
 						mockF5.state.policies[policy.id()])
 				}
 
-				certcafname := fmt.Sprintf("%s-https-chain.crt", rulename)
+				certcafname := fmt.Sprintf("%s/%s-https-cabundle.crt", foldername, rulename)
 				_, found = mockF5.state.certs[certcafname]
 				if !found {
 					return fmt.Errorf("Certificate chain file %s should have been"+
@@ -2130,7 +2342,7 @@ func TestHandleRoute(t *testing.T) {
 						certcafname, mockF5.state.certs)
 				}
 
-				keyfname := fmt.Sprintf("%s-https-key.key", rulename)
+				keyfname := fmt.Sprintf("%s/%s-https-key.key", foldername, rulename)
 				_, found = mockF5.state.keys[keyfname]
 				if !found {
 					return fmt.Errorf("Key file %s should have been created but"+
@@ -2138,7 +2350,7 @@ func TestHandleRoute(t *testing.T) {
 						keyfname, mockF5.state.keys)
 				}
 
-				clientSslProfileName := fmt.Sprintf("%s-client-ssl-profile", rulename)
+				clientSslProfileName := fmt.Sprintf("%s/%s-client-ssl-profile", foldername, rulename)
 				_, found = mockF5.state.clientSslProfiles[clientSslProfileName]
 				if !found {
 					return fmt.Errorf("client-ssl profile %s should have been created"+
@@ -2155,7 +2367,7 @@ func TestHandleRoute(t *testing.T) {
 						mockF5.state.vserverProfiles[httpsVserver.id()])
 				}
 
-				serverSslProfileName := fmt.Sprintf("%s-server-ssl-profile", rulename)
+				serverSslProfileName := fmt.Sprintf("%s/%s-server-ssl-profile", foldername, rulename)
 				_, found = mockF5.state.serverSslProfiles[serverSslProfileName]
 				if !found {
 					return fmt.Errorf("server-ssl profile %s should have been created"+
@@ -2189,10 +2401,10 @@ func TestHandleRoute(t *testing.T) {
 					},
 					TLS: &routeapi.TLSConfig{
 						Termination:              routeapi.TLSTerminationReencrypt,
-						Certificate:              "abc",
-						Key:                      "def",
-						CACertificate:            "ghi",
-						DestinationCACertificate: "jkl",
+						Certificate:              string(dummyCert),
+						Key:                      string(dummyKey),
+						CACertificate:            string(dummyCert),
+						DestinationCACertificate: string(dummyCert),
 					},
 				},
 			},
@@ -2275,6 +2487,8 @@ func TestHandleRouteModifications(t *testing.T) {
 	}
 	defer mockF5.close()
 
+	dummyKey, dummyCert := dummyX509Objects()
+
 	testRoute := &routeapi.Route{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "foo",
@@ -2296,10 +2510,10 @@ func TestHandleRouteModifications(t *testing.T) {
 	// Verify that modifying the route into a secure route works.
 	testRoute.Spec.TLS = &routeapi.TLSConfig{
 		Termination:              routeapi.TLSTerminationReencrypt,
-		Certificate:              "abc",
-		Key:                      "def",
-		CACertificate:            "ghi",
-		DestinationCACertificate: "jkl",
+		Certificate:              string(dummyCert),
+		Key:                      string(dummyKey),
+		CACertificate:            string(dummyCert),
+		DestinationCACertificate: string(dummyCert),
 	}
 
 	err = router.HandleRoute(watch.Modified, testRoute)
@@ -2344,6 +2558,8 @@ func TestF5RouterSuccessiveInstances(t *testing.T) {
 		t.Fatalf("Failed to initialize test router: %v", err)
 	}
 
+	dummyKey, dummyCert := dummyX509Objects()
+
 	testRoute := &routeapi.Route{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "xyzzy",
@@ -2356,10 +2572,10 @@ func TestF5RouterSuccessiveInstances(t *testing.T) {
 			},
 			TLS: &routeapi.TLSConfig{
 				Termination:              routeapi.TLSTerminationReencrypt,
-				Certificate:              "abc",
-				Key:                      "def",
-				CACertificate:            "ghi",
-				DestinationCACertificate: "jkl",
+				Certificate:              string(dummyCert),
+				Key:                      string(dummyKey),
+				CACertificate:            string(dummyCert),
+				DestinationCACertificate: string(dummyCert),
 			},
 		},
 	}

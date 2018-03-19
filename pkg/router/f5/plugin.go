@@ -63,15 +63,15 @@ type F5PluginConfig struct {
 // NewF5Plugin makes a new f5 router plugin.
 func NewF5Plugin(cfg F5PluginConfig) (*F5Plugin, error) {
 	f5LTMCfg := f5LTMCfg{
-		host:            cfg.Host,
-		cabundle:        cfg.CaBundle,
-		althostname:     cfg.AltHostname,
-		username:        cfg.Username,
-		password:        cfg.Password,
-		partitionPath:   cfg.PartitionPath,
-		enableVxlan:     cfg.EnableVxlan,
-		httpVserver:     cfg.HttpVserver,
-		httpsVserver:    cfg.HttpsVserver,
+		host:			cfg.Host,
+		cabundle:		cfg.CaBundle,
+		althostname:	cfg.AltHostname,
+		username:		cfg.Username,
+		password:		cfg.Password,
+		partitionPath:  cfg.PartitionPath,
+		enableVxlan:	cfg.EnableVxlan,
+		httpVserver:	cfg.HttpVserver,
+		httpsVserver:	cfg.HttpsVserver,
 	}
 	f5, err := newF5LTM(f5LTMCfg)
 	if err != nil {
@@ -102,7 +102,8 @@ func (p *F5Plugin) ensurePoolExists(poolname string) error {
 
 // updatePool update the named pool (which must already exist in F5 BIG-IP) with
 // the given endpoints.
-func (p *F5Plugin) updatePool(poolname string, endpoints *kapi.Endpoints) error {
+// We must include poolport here so that we can update the pool member with the correct port
+func (p *F5Plugin) updatePool(poolname string, poolport int32, endpoints *kapi.Endpoints) error {
 	// Check if the pool exists.
 	poolExists, err := p.F5Client.PoolExists(poolname)
 	if err != nil {
@@ -155,18 +156,22 @@ func (p *F5Plugin) updatePool(poolname string, endpoints *kapi.Endpoints) error 
 	for _, subset := range endpoints.Subsets {
 		for _, addr := range subset.Addresses {
 			for _, port := range subset.Ports {
-				dest := fmt.Sprintf("%s:%d", addr.IP, port.Port)
-				exists := needToDelete[dest]
-				needToDelete[dest] = false
-				if exists {
-					glog.V(4).Infof("  Skipping %s because it already exists.", dest)
-				} else {
-					glog.V(4).Infof("  Adding %s...", dest)
-					err = p.F5Client.AddPoolMember(poolname, dest)
-					if err != nil {
-						glog.V(4).Infof("  Error adding endpoint %s to pool %s: %v",
-							dest, poolname, err)
+				if poolport == port.Port {
+					dest := fmt.Sprintf("%s:%d", addr.IP, port.Port)
+					exists := needToDelete[dest]
+					needToDelete[dest] = false
+					if exists {
+						glog.V(4).Infof("  Skipping %s because it already exists.", dest)
+					} else {
+						glog.V(4).Infof("  Adding %s...", dest)
+						err = p.F5Client.AddPoolMember(poolname, dest)
+						if err != nil {
+							glog.V(4).Infof("  Error adding endpoint %s to pool %s: %v",
+								dest, poolname, err)
+						}
 					}
+				} else {
+					glog.V(4).Infof("Skipping adding endpoint %s:%d to pool %s, because port does not match poolname", addr.IP, port.Port, poolname)
 				}
 			}
 		}
@@ -236,11 +241,28 @@ func (p *F5Plugin) deletePoolIfEmpty(poolname string) error {
 	return nil
 }
 
-// poolName returns a string that can be used as a poolname in F5 BIG-IP and
-// is distinct for the given endpoints namespace and name.
-func poolName(endpointsNamespace, endpointsName string) string {
-	return fmt.Sprintf("openshift_%s_%s", endpointsNamespace, endpointsName)
+// Method to help construct a pool name in HandleEndpoints()
+// The reason there is one endpointPoolName() and one 
+// routePoolName() method is because that in the first case,
+// we need to check if portName is an empty string, but in
+// the other if Port is nil
+func endpointPoolName(endpoints *kapi.Endpoints, portName string) string {
+	if portName == "" {
+		return fmt.Sprintf("openshift_%s_%s", endpoints.Namespace, endpoints.Name)
+	} else {
+		return fmt.Sprintf("openshift_%s_%s_%s", endpoints.Namespace, endpoints.Name, portName)
+	}
 }
+
+// Method to help construct a pool name in HandleRoute()
+func routePoolName(route *routeapi.Route) string {
+	if route.Spec.Port == nil {
+		return fmt.Sprintf("openshift_%s_%s", route.Namespace, route.Spec.To.Name)
+	} else {
+		return fmt.Sprintf("openshift_%s_%s_%s", route.Namespace, route.Spec.To.Name, route.Spec.Port.TargetPort.String())
+	}
+}
+
 
 func (p *F5Plugin) checkActive() (bool, error) {
 	active, err := p.F5Client.CheckActive()
@@ -257,10 +279,6 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType, endpoints *kapi.En
 
 	glog.V(4).Infof("Processing %d Endpoints for Name: %v (%v)", len(endpoints.Subsets), endpoints.Name, eventType)
 
-	for i, s := range endpoints.Subsets {
-		glog.V(4).Infof("  Subset %d : %#v", i, s)
-	}
-
 	active, err := p.checkActive()
 	if err != nil {
 		return err
@@ -271,73 +289,47 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType, endpoints *kapi.En
 
 	switch eventType {
 	case watch.Added, watch.Modified:
-		// Name of the pool in F5.
-		poolname := poolName(endpoints.Namespace, endpoints.Name)
 
-		if len(endpoints.Subsets) == 0 {
-			// LTM does not permit us to delete a pool if something is pointing
-			// to it, eg. an LTM policy rule.
-			//
-			// However, a pool does not necessarily have a rule associated with
-			// it because it may be from a service for which no route was created.
-			//
-			// We first delete the endpoints from the pool.
-			//
-			// Then we try to delete the pool, in case there is no route associated
-			// (but then again should it not be there, if pool creation is related
-			// to the existence of a service?)
-			//
-			// But if there *is* a route associated though, the delete will fail and
-			// we will have to rely on HandleRoute to delete the pool when it deletes
-			// the route.
+		for _, subset := range endpoints.Subsets {
+			for _, port := range subset.Ports {
 
-			glog.V(4).Infof("Empty set of subnets for endpoint.  Deleting endpoints for pool %s", poolname)
+				poolname := endpointPoolName(endpoints, port.Name)
+				glog.V(4).Infof("Pool name for endpoint %s: %s", endpoints.Name, poolname)
 
-			err := p.updatePool(poolname, endpoints)
-			if err != nil {
-				return err
-			}
+				err := p.ensurePoolExists(poolname)
+				if err != nil {
+					return err
+				}
 
-			glog.V(4).Infof("Deleting pool %s", poolname)
-
-			err = p.deletePool(poolname)
-			if err != nil {
-				// Note: deletePool will throw errors if the route
-				//       has not been deleted as the policy would
-				//       still refer to the pool. That is ok as the
-				//       pool will still get deleted when the route
-				//       gets deleted.
-				if ! p.F5Client.IsReferenced(err) {
+				err = p.updatePool(poolname, port.Port, endpoints)
+				if err != nil {
 					return err
 				}
 			}
-		} else {
-			glog.V(4).Infof("Updating or adding endpoints for pool %s", poolname)
-
-			err := p.ensurePoolExists(poolname)
-			if err != nil {
-				return err
-			}
-
-			err = p.updatePool(poolname, endpoints)
-			if err != nil {
-				return err
-			}
 		}
+
 	case watch.Deleted:
-		poolname := poolName(endpoints.Namespace, endpoints.Name)
-		// presumably, the endpoints are a nil subnet now, reset it anyway
-		endpoints.Subsets = nil
-		err := p.updatePool(poolname, endpoints)
-		if err != nil {
-			return err
-		}
 
-		glog.V(4).Infof("Deleting pool %s", poolname)
+		for _, subset := range endpoints.Subsets {
+			for _, port := range subset.Ports {
 
-		err = p.deletePool(poolname)
-		if err != nil {
-			return err
+                poolname := endpointPoolName(endpoints, port.Name)
+                glog.V(4).Infof("Pool name for endpoint %s: %s", endpoints.Name, poolname)
+
+				// presumably, the endpoints are a nil subnet now, reset it anyway
+				endpoints.Subsets = nil
+				err := p.updatePool(poolname, port.Port, endpoints)
+				if err != nil {
+					return err
+				}
+
+				glog.V(4).Infof("Deleting pool %s", poolname)
+
+				err = p.deletePool(poolname)
+				if err != nil {
+					return err
+				}
+			}
 		}
 	}
 
@@ -626,7 +618,7 @@ func (p *F5Plugin) HandleNode(eventType watch.EventType, node *kapi.Node) error 
 // HandleRoute processes watch events on the Route resource and
 // creates and deletes policy rules in response.
 func (p *F5Plugin) HandleRoute(eventType watch.EventType, route *routeapi.Route) error {
-	glog.V(4).Infof("Processing route for service: %v (%v)", route.Spec.To, route)
+	glog.V(4).Infof("Processing route for service: %s (%v)", route.Spec.To, route)
 
 	active, err := p.checkActive()
 	if err != nil {
@@ -636,8 +628,8 @@ func (p *F5Plugin) HandleRoute(eventType watch.EventType, route *routeapi.Route)
 		return nil
 	}
 
-	// Name of the pool in F5.
-	poolname := poolName(route.Namespace, route.Spec.To.Name)
+	poolname := routePoolName(route)
+	glog.V(4).Infof("Pool name for route %s: %s" ,route.Name, poolname)
 
 	// Virtual hostname for policy rule in F5.
 	hostname := route.Spec.Host
