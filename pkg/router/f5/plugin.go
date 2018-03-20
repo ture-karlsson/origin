@@ -375,6 +375,7 @@ func (p *F5Plugin) addRoute(routename, poolname, hostname, pathname string,
 		prettyPathname = "(any)"
 	}
 
+	// Insecure route
 	if tls == nil || len(tls.Termination) == 0 {
 		glog.V(4).Infof("Adding insecure route %s for pool %s,"+
 			" hostname %s, pathname %s...",
@@ -386,6 +387,7 @@ func (p *F5Plugin) addRoute(routename, poolname, hostname, pathname string,
 			return err
 		}
 
+	// Passthrough route
 	} else if tls.Termination == routeapi.TLSTerminationPassthrough {
 		glog.V(4).Infof("Adding passthrough route %s for pool %s, hostname %s...",
 			routename, poolname, hostname)
@@ -394,6 +396,19 @@ func (p *F5Plugin) addRoute(routename, poolname, hostname, pathname string,
 			glog.V(4).Infof("Error adding passthrough route for pool %s: %v",
 				poolname, err)
 			return err
+		}
+
+		// Passthrough/Redirect route
+		// The naming InsecureEdgeTerminationPolicy here is confusing since this is not an edge route,
+		// but the TLSConfig API object only defines these values for Edge routes.
+		// The functionality of the redirect route is the same whether TLS is Edge or Passthrough.
+		if tls.InsecureEdgeTerminationPolicy == routeapi.InsecureEdgeTerminationPolicyRedirect {
+			glog.V(4).Infof("Add secure redirect for route %s pool %s, hostname %s, pathname %s", routename, poolname, hostname, prettyPathname)
+			err := p.F5Client.AddInsecureRedirectRoute(routename, poolname, hostname, pathname)
+			if err != nil {
+				glog.V(4).Infof("Error allowing redirect route for pool %s: %v", poolname, err)
+				return err
+			}
 		}
 
 	} else {
@@ -416,6 +431,7 @@ func (p *F5Plugin) addRoute(routename, poolname, hostname, pathname string,
 			return err
 		}
 
+		// Reencrypt route
 		if tls.Termination == routeapi.TLSTerminationReencrypt {
 			// add to reencrypt dg
 			glog.V(4).Infof("Adding re-encrypt route %s for pool %s,"+
@@ -424,6 +440,20 @@ func (p *F5Plugin) addRoute(routename, poolname, hostname, pathname string,
 			p.F5Client.AddReencryptRoute(routename, poolname, hostname)
 		}
 
+		// Reencrypt/Redirect route
+		// The naming InsecureEdgeTerminationPolicy here is confusing since this is not an edge route,
+		// but the TLSConfig API object only defines these values for Edge routes.
+		// The functionality of the redirect route is the same whether TLS is Edge or Reencrypt.
+		if tls.Termination == routeapi.TLSTerminationReencrypt && tls.InsecureEdgeTerminationPolicy == routeapi.InsecureEdgeTerminationPolicyRedirect {
+			glog.V(4).Infof("Add secure redirect for route %s pool %s, hostname %s, pathname %s", routename, poolname, hostname, prettyPathname)
+			err := p.F5Client.AddInsecureRedirectRoute(routename, poolname, hostname, pathname)
+			if err != nil {
+				glog.V(4).Infof("Error allowing redirect route for pool %s: %v", poolname, err)
+				return err
+			}
+		}
+
+		// Edge/Redirect route
 		if tls.Termination == routeapi.TLSTerminationEdge && tls.InsecureEdgeTerminationPolicy == routeapi.InsecureEdgeTerminationPolicyRedirect {
 			glog.V(4).Infof("Add secure redirect for route %s pool %s, hostname %s, pathname %s", routename, poolname, hostname, prettyPathname)
 			err := p.F5Client.AddInsecureRedirectRoute(routename, poolname, hostname, pathname)
@@ -433,6 +463,7 @@ func (p *F5Plugin) addRoute(routename, poolname, hostname, pathname string,
 			}
 		}
 
+		// Edge/Allow route
 		if tls.Termination == routeapi.TLSTerminationEdge && tls.InsecureEdgeTerminationPolicy == routeapi.InsecureEdgeTerminationPolicyAllow {
 			glog.V(4).Infof("Allowing insecure route %s for pool %s, hostname %s, pathname %s...", routename, poolname, hostname, prettyPathname)
 			err := p.F5Client.AddInsecureRoute(routename, poolname, hostname, pathname)
