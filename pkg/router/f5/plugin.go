@@ -293,17 +293,41 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType, endpoints *kapi.En
 		for _, subset := range endpoints.Subsets {
 			for _, port := range subset.Ports {
 
-				poolname := endpointPoolName(endpoints, port.Name)
-				glog.V(4).Infof("Pool name for endpoint %s: %s", endpoints.Name, poolname)
+				// We will put each enpoint in potentially two pools if then endpoint have a targetPort name set:
+				// shortPoolName := openshift_namespace_endpoint
+				// longPoolName  := openshift_namespace_endpoint_targetport
+				// This is to solve the situation where an endpoint has a specified targetPort, but the route does not.
+				// Note: This will only work if there is ONE endpoint endpoint port, i.e. it will not work in the case
+				// where you have multiple containers in one pod. Then you have to specify in the route which port
+				// that the route should point to.
+				shortPoolName := endpointPoolName(endpoints, "")
+				glog.V(4).Infof("Short pool name for endpoint %s: %s", endpoints.Name, shortPoolName)
 
-				err := p.ensurePoolExists(poolname)
+				err := p.ensurePoolExists(shortPoolName)
 				if err != nil {
 					return err
 				}
 
-				err = p.updatePool(poolname, port.Port, endpoints)
+				err = p.updatePool(shortPoolName, port.Port, endpoints)
 				if err != nil {
 					return err
+				 }
+
+				longPoolName := endpointPoolName(endpoints, port.Name)
+				glog.V(4).Infof("Long pool name for endpoint %s: %s", endpoints.Name, longPoolName)
+
+				if shortPoolName != longPoolName {
+					err = p.ensurePoolExists(longPoolName)
+					if err != nil {
+						return err
+					}
+
+					err = p.updatePool(longPoolName, port.Port, endpoints)
+					if err != nil {
+						return err
+					}
+				} else {
+					glog.V(4).Infof("Don't update pool twice, since shortPoolName == longPoolName")
 				}
 			}
 		}
@@ -313,21 +337,42 @@ func (p *F5Plugin) HandleEndpoints(eventType watch.EventType, endpoints *kapi.En
 		for _, subset := range endpoints.Subsets {
 			for _, port := range subset.Ports {
 
-                poolname := endpointPoolName(endpoints, port.Name)
-                glog.V(4).Infof("Pool name for endpoint %s: %s", endpoints.Name, poolname)
+				shortPoolName := endpointPoolName(endpoints, "")
+				glog.V(4).Infof("Short pool name for endpoint %s: %s", endpoints.Name, shortPoolName)
 
-				// presumably, the endpoints are a nil subnet now, reset it anyway
 				endpoints.Subsets = nil
-				err := p.updatePool(poolname, port.Port, endpoints)
+				err := p.updatePool(shortPoolName, port.Port, endpoints)
 				if err != nil {
 					return err
 				}
 
-				glog.V(4).Infof("Deleting pool %s", poolname)
+				glog.V(4).Infof("Deleting pool %s", shortPoolName)
 
-				err = p.deletePool(poolname)
+				err = p.deletePool(shortPoolName)
 				if err != nil {
 					return err
+				}
+
+				longPoolName := endpointPoolName(endpoints, port.Name)
+				glog.V(4).Infof("Long pool name for endpoint %s: %s", endpoints.Name, longPoolName)
+
+				if shortPoolName != longPoolName {
+
+					endpoints.Subsets = nil
+					err = p.updatePool(longPoolName, port.Port, endpoints)
+					if err != nil {
+						return err
+					}
+
+					glog.V(4).Infof("Deleting pool %s", longPoolName)
+
+					err = p.deletePool(longPoolName)
+					if err != nil {
+						return err
+					}
+
+				} else {
+					glog.V(4).Infof("Don't delete pool twice, since shortPoolName == longPoolName")
 				}
 			}
 		}
